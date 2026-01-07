@@ -1,0 +1,2 @@
+# irrigation_decision_support_system
+Decision support system for agricultural irrigation based on open meteorological data. The project integrates climate data to calculate reference evapotranspiration (ET₀) and crop water requirements (Kc), enabling efficient irrigation planning across different regions and time periods.
