@@ -1,0 +1,265 @@
+{
+  "datos": [
+    {
+      "Provincia": "Álava",
+      "Codigo": "VI",
+      "Codigo_CCAA": "PVA"
+    },
+    {
+      "Provincia": "Albacete",
+      "Codigo": "AB",
+      "Codigo_CCAA": "CAM"
+    },
+    {
+      "Provincia": "Alicante/Alacant",
+      "Codigo": "A",
+      "Codigo_CCAA": "VAL"
+    },
+    {
+      "Provincia": "Almería",
+      "Codigo": "AL",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "Ávila",
+      "Codigo": "AV",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Badajoz",
+      "Codigo": "BA",
+      "Codigo_CCAA": "EXT"
+    },
+    {
+      "Provincia": "Balears, Illes",
+      "Codigo": "IB",
+      "Codigo_CCAA": "BAL"
+    },
+    {
+      "Provincia": "Barcelona",
+      "Codigo": "B",
+      "Codigo_CCAA": "CAT"
+    },
+    {
+      "Provincia": "Burgos",
+      "Codigo": "BU",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Cáceres",
+      "Codigo": "CC",
+      "Codigo_CCAA": "EXT"
+    },
+    {
+      "Provincia": "Cádiz",
+      "Codigo": "CA",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "Castellón/Castelló",
+      "Codigo": "CS",
+      "Codigo_CCAA": "VAL"
+    },
+    {
+      "Provincia": "Ciudad Real",
+      "Codigo": "CR",
+      "Codigo_CCAA": "CAM"
+    },
+    {
+      "Provincia": "Córdoba",
+      "Codigo": "CO",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "Coruña, A",
+      "Codigo": "C",
+      "Codigo_CCAA": "GAL"
+    },
+    {
+      "Provincia": "Cuenca",
+      "Codigo": "CU",
+      "Codigo_CCAA": "CAM"
+    },
+    {
+      "Provincia": "Girona",
+      "Codigo": "GI",
+      "Codigo_CCAA": "CAT"
+    },
+    {
+      "Provincia": "Granada",
+      "Codigo": "GR",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "Guadalajara",
+      "Codigo": "GU",
+      "Codigo_CCAA": "CAM"
+    },
+    {
+      "Provincia": "Guipúzcoa",
+      "Codigo": "SS",
+      "Codigo_CCAA": "PVA"
+    },
+    {
+      "Provincia": "Huelva",
+      "Codigo": "H",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "Huesca",
+      "Codigo": "HU",
+      "Codigo_CCAA": "ARA"
+    },
+    {
+      "Provincia": "Jaén",
+      "Codigo": "J",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "León",
+      "Codigo": "LE",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Lleida",
+      "Codigo": "LL",
+      "Codigo_CCAA": "CAT"
+    },
+    {
+      "Provincia": "Rioja, La",
+      "Codigo": "LO",
+      "Codigo_CCAA": "RIO"
+    },
+    {
+      "Provincia": "Lugo",
+      "Codigo": "LU",
+      "Codigo_CCAA": "GAL"
+    },
+    {
+      "Provincia": "Madrid",
+      "Codigo": "M",
+      "Codigo_CCAA": "MAD"
+    },
+    {
+      "Provincia": "Málaga",
+      "Codigo": "MA",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "Murcia",
+      "Codigo": "MU",
+      "Codigo_CCAA": "MUR"
+    },
+    {
+      "Provincia": "Navarra",
+      "Codigo": "NA",
+      "Codigo_CCAA": "NAV"
+    },
+    {
+      "Provincia": "Ourense",
+      "Codigo": "OU",
+      "Codigo_CCAA": "GAL"
+    },
+    {
+      "Provincia": "Asturias",
+      "Codigo": "O",
+      "Codigo_CCAA": "AST"
+    },
+    {
+      "Provincia": "Palencia",
+      "Codigo": "P",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Palmas, Las",
+      "Codigo": "GC",
+      "Codigo_CCAA": "CAN"
+    },
+    {
+      "Provincia": "Pontevedra",
+      "Codigo": "PO",
+      "Codigo_CCAA": "GAL"
+    },
+    {
+      "Provincia": "Salamanca",
+      "Codigo": "SA",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Santa Cruz de Tenerife",
+      "Codigo": "TF",
+      "Codigo_CCAA": "CAN"
+    },
+    {
+      "Provincia": "Cantabria",
+      "Codigo": "S",
+      "Codigo_CCAA": "SAN"
+    },
+    {
+      "Provincia": "Segovia",
+      "Codigo": "SG",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Sevilla",
+      "Codigo": "SE",
+      "Codigo_CCAA": "AND"
+    },
+    {
+      "Provincia": "Soria",
+      "Codigo": "SO",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Tarragona",
+      "Codigo": "T",
+      "Codigo_CCAA": "CAT"
+    },
+    {
+      "Provincia": "Teruel",
+      "Codigo": "TE",
+      "Codigo_CCAA": "ARA"
+    },
+    {
+      "Provincia": "Toledo",
+      "Codigo": "TO",
+      "Codigo_CCAA": "CAM"
+    },
+    {
+      "Provincia": "Valencia/València",
+      "Codigo": "V",
+      "Codigo_CCAA": "VAL"
+    },
+    {
+      "Provincia": "Valladolid",
+      "Codigo": "VA",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Vizcaya",
+      "Codigo": "BI",
+      "Codigo_CCAA": "PVA"
+    },
+    {
+      "Provincia": "Zamora",
+      "Codigo": "ZA",
+      "Codigo_CCAA": "CAL"
+    },
+    {
+      "Provincia": "Zaragoza",
+      "Codigo": "Z",
+      "Codigo_CCAA": "ARA"
+    },
+    {
+      "Provincia": "Ceuta",
+      "Codigo": "CE",
+      "Codigo_CCAA": "CEU"
+    },
+    {
+      "Provincia": "Melilla",
+      "Codigo": "ML",
+      "Codigo_CCAA": "MEL"
+    }
+  ],
+  "MensajeRespuesta": null
+}
