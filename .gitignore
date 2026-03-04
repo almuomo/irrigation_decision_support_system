@@ -2,3 +2,5 @@
 .env
 data
 Develop
+info
+scripts/__pycache__

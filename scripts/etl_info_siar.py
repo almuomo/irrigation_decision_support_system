@@ -30,7 +30,7 @@ def utc_now_iso() -> str:
 def make_run_id(ts: datetime | None = None) -> str:
     """
     ID de ejecución estable para nombres de ficheros (UTC).
-    Ej: 20260222_153210
+    Ej: 20260222
     """
     ts = ts or utc_now()
     return ts.strftime("%Y%m%d")
@@ -83,14 +83,18 @@ def get_info_raw(token: str, tipo: str, timeout: int = 30) -> dict:
     Devuelve el JSON original del endpoint Info/{tipo}
     """
     tipo = tipo.upper().strip()
+    url = f"{BASE}/API/V1/Info/{tipo}"
 
-    token_q = urllib.parse.quote(token, safe="")
-    url = f"{BASE}/API/V1/Info/{tipo}?token={token_q}"
+    r = requests.get(url, params={"token": token}, timeout=timeout)
 
-    r = requests.get(url, timeout=timeout)
     if not r.ok:
         raise RuntimeError(f"[SIAR] Error {r.status_code} en Info/{tipo}: {r.text[:500]}")
-    return r.json()
+
+    try:
+        return r.json()
+    except ValueError:
+        # Respuesta no-JSON (a veces pasa en APIs con errores intermedios)
+        raise RuntimeError(f"[SIAR] Respuesta no JSON en Info/{tipo}: {r.text[:500]}")
 
 
 def extract_info_raw(token: str, tipos: List[str], timeout: int = 30) -> Dict[str, dict]:
