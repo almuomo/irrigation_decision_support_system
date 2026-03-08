@@ -1,0 +1,15 @@
+{
+  "api": {
+    "siar_base_url": "https://servicio.mapa.gob.es/siarapi"
+  },
+  "paths": {
+    "project_root": ".",
+    "data_bronze_info_dir": "data/bronce/info",
+    "data_bronze_datos_dir": "data/bronce/datos",
+    "data_silver_dir": "data/silver",
+    "data_gold_dir": "data/gold",
+    "dim_estacion_path": "data/gold/dim_estacion.parquet",
+    "checkpoint_siar_diarios_estacion": "info/checkpoints/siar_diarios_estacion.json",
+    "logs_dir": "info/logs"
+  }
+}
