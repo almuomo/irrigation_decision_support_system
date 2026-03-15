@@ -6,7 +6,7 @@ import pandas as pd
 
 from scripts.get_token import get_siar_token
 from scripts.etl_info_siar import run_info_pipeline
-from scripts.etl_datos_siar import run_incremental_diarios_por_estacion, log_line
+from scripts.etl_datos_siar import run_datos_pipeline, log_line
 from scripts.common.settings import DIM_ESTACION_PATH
 
 DIM_EST_PATH = DIM_ESTACION_PATH
@@ -99,12 +99,12 @@ def main():
         # run_info_pipeline(token=token)
 
         # 3️⃣ Pipeline DATOS
-        log_line("[INFO] Ejecutando pipeline DATOS (Diarios + ESTACION)...")
-
+        log_line("[INFO] Ejecutando pipeline DATOS...")
+        
         estaciones, bajas = load_stations_and_bajas()
         log_line(f"[INFO] Número de estaciones cargadas: {len(estaciones)}")
 
-        run_incremental_diarios_por_estacion(
+        run_datos_pipeline(
             token=token,
             estaciones=estaciones,
             station_bajas=bajas,

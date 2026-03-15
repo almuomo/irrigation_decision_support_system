@@ -10,6 +10,7 @@ from scripts.common.settings import (
     SIAR_BASE_URL,
     DATA_BRONZE_DATOS_DIR,
     DATA_SILVER_DIR,
+    DATA_GOLD_DIR,
     CHECKPOINT_SIAR_DIARIOS_ESTACION,
     LOGS_DIR,
 )
@@ -20,6 +21,7 @@ import requests
 BASE = SIAR_BASE_URL
 BRONZE_DIR = DATA_BRONZE_DATOS_DIR
 SILVER_DIR = DATA_SILVER_DIR
+GOLD_DIR = DATA_GOLD_DIR
 CHECKPOINT_PATH = CHECKPOINT_SIAR_DIARIOS_ESTACION
 LOG_DIR = LOGS_DIR
 
@@ -174,6 +176,9 @@ def sanitize_query_dates(fecha_ini: str, fecha_fin: str) -> tuple[str, str]:
     return d_ini.isoformat(), d_fin.isoformat()
 
 
+# -------------------------
+# BRONCE
+# -------------------------
 def fetch_diarios_estacion(token: str, estacion_id: str, fecha_ini: str, fecha_fin: str, datos_calculados: bool, timeout: int = DEFAULT_TIMEOUT, max_retries: int = 6,) -> Dict[str, Any]:
     """
     Descarga datos diarios de una estación SIAR para un intervalo de fechas.
@@ -279,6 +284,10 @@ def save_bronze_chunk(payload: Dict[str, Any], estacion_id: str, fecha_ini: str,
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return path
 
+
+# -------------------------
+# SILVER
+# -------------------------
 def upsert_silver_append_dedupe(df_new: pd.DataFrame, path: Path, key_cols: List[str]) -> None:
     """
     Actualiza un parquet Silver añadiendo nuevos registros y eliminando duplicados.
@@ -341,6 +350,85 @@ def load_silver_minimal(silver_path: Path, cols: List[str]) -> Optional[pd.DataF
     if not silver_path.exists():
         return None
     return pd.read_parquet(silver_path, columns=[c for c in cols if c])
+
+def save_df_overwrite(df: pd.DataFrame, path: Path) -> None:
+    """
+    Guarda un DataFrame sobrescribiendo la versión previa.
+    Intenta parquet y si falla guarda CSV.
+    """
+    ensure_dir(path.parent)
+
+    if path.exists():
+        path.unlink()
+
+    csv_path = path.with_suffix(".csv")
+    if csv_path.exists():
+        csv_path.unlink()
+
+    try:
+        df.to_parquet(path, index=False)
+    except Exception:
+        df.to_csv(csv_path, index=False, encoding="utf-8")
+
+
+def read_table(path: Path) -> pd.DataFrame:
+    """
+    Lee una tabla desde parquet o desde CSV alternativo.
+    """
+    if path.exists():
+        return pd.read_parquet(path)
+
+    csv_path = path.with_suffix(".csv")
+    if csv_path.exists():
+        return pd.read_csv(csv_path)
+
+    raise FileNotFoundError(f"No existe {path} ni {csv_path}")
+# -------------------------
+# GOLD
+# -------------------------
+def run_datos_gold(datos_calculados: bool = True) -> Dict[str, Path]:
+    """
+    Ejecuta la capa Gold para los datos diarios SIAR.
+
+    Lee el parquet Silver de diarios por estación y genera un snapshot Gold
+    manteniendo una estructura estable para consumo analítico.
+    """
+    silver_path = SILVER_DIR / f"siar_diarios_estacion_calc{int(datos_calculados)}.parquet"
+    df = read_table(silver_path).copy()
+
+    if df.empty:
+        raise ValueError(f"El fichero Silver está vacío: {silver_path}")
+
+    # Estandarización mínima opcional
+    # Solo renombrar si existen esas columnas
+    rename_map = {
+        "Estacion": "estacion_codigo",
+        "Fecha": "fecha",
+    }
+    rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
+    df = df.rename(columns=rename_map)
+
+    # Normalización básica
+    if "estacion_codigo" in df.columns:
+        df["estacion_codigo"] = df["estacion_codigo"].astype("string").str.strip().str.upper()
+
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
+
+    # Metadato de snapshot Gold
+    df["gold_generated_utc"] = utc_now().isoformat()
+
+    # Ordenar para dejar estructura estable
+    sort_cols = [c for c in ["estacion_codigo", "fecha"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
+    gold_path = GOLD_DIR / f"fact_siar_diarios_estacion_calc{int(datos_calculados)}.parquet"
+    save_df_overwrite(df, gold_path)
+
+    log_line(f"[OK] GOLD generado -> {gold_path.name} filas={len(df)}")
+
+    return {"FACT_DIARIOS_ESTACION": gold_path}
 
 
 def is_month_complete_in_silver(df_silver: Optional[pd.DataFrame], estacion: str, month_start: date, month_end: date) -> bool:
@@ -567,6 +655,42 @@ def run_incremental_diarios_por_estacion(
                 save_checkpoint(state)
                 log_line(f"[ERROR] est={est} rango={fecha_ini}..{fecha_fin} err={repr(e)}")
                 raise
-
+        
     save_checkpoint(state)
     log_line("[DONE] Incremental completo.")
+
+
+def run_datos_pipeline(
+    token: str,
+    estaciones: List[str],
+    station_bajas: Optional[Dict[str, Optional[str]]] = None,
+    start_date: str = "2020-01-01",
+    end_date: Optional[str] = None,
+    datos_calculados: bool = True,
+    min_access_buffer: int = 5,
+    min_records_buffer: int = 2000,
+    sleep_s: float = 0.3,
+) -> None:
+    """
+    Orquesta la carga de datos diarios SIAR:
+    Bronze -> Silver incremental -> Gold snapshot
+    """
+    log_line("[INFO] Iniciando pipeline SIAR DATOS...")
+
+    run_incremental_diarios_por_estacion(
+        token=token,
+        estaciones=estaciones,
+        station_bajas=station_bajas,
+        start_date=start_date,
+        end_date=end_date,
+        datos_calculados=datos_calculados,
+        min_access_buffer=min_access_buffer,
+        min_records_buffer=min_records_buffer,
+        sleep_s=sleep_s,
+    )
+
+    g = run_datos_gold(datos_calculados=datos_calculados)
+    for t, p in g.items():
+        log_line(f"[OK] GOLD snapshot {t} -> {p}")
+
+    log_line("[INFO] Pipeline SIAR DATOS finalizado.")
