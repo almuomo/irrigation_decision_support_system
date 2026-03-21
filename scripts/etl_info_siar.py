@@ -292,6 +292,62 @@ def payload_to_df(payload: dict) -> pd.DataFrame:
     return pd.DataFrame(datos)
 
 
+def dms_compacto_a_decimal(valor: str):
+    """
+    Convierte coordenadas geográficas en formato compacto SIAR a decimal.
+
+    Ejemplos:
+        015512000W -> -1.920000
+        391520000N -> 39.255556
+
+    Formato esperado:
+        [grados][minutos][segundos][milésimas][hemisferio]
+    donde:
+        - el último carácter es N/S/E/W
+        - los 7 dígitos anteriores son MMSSmmm
+        - lo anterior son los grados
+
+    Args:
+        valor (str): Coordenada en formato compacto SIAR.
+
+    Returns:
+        float | pd.NA: Coordenada en decimal o NA si no se puede convertir.
+    """
+    if pd.isna(valor):
+        return pd.NA
+
+    s = str(valor).strip().upper()
+    if len(s) < 8:
+        return pd.NA
+
+    hemisferio = s[-1]
+    numeros = s[:-1]
+
+    if hemisferio not in {"N", "S", "E", "W"}:
+        return pd.NA
+
+    if not numeros.isdigit():
+        return pd.NA
+
+    try:
+        grados = int(numeros[:-7])
+        minutos = int(numeros[-7:-5])
+        segundos_enteros = int(numeros[-5:-3])
+        segundos_milesimas = int(numeros[-3:])
+
+        segundos = float(f"{segundos_enteros}.{segundos_milesimas}")
+
+        decimal = grados + (minutos / 60) + (segundos / 3600)
+
+        if hemisferio in {"W", "S"}:
+            decimal *= -1
+
+        return decimal
+
+    except Exception:
+        return pd.NA
+    
+
 def run_info_silver() -> Dict[str, Path]:
     """
     Ejecuta la capa Silver del pipeline de información SIAR.
@@ -378,8 +434,43 @@ def run_info_silver() -> Dict[str, Path]:
         if c in df_est.columns:
             df_est[c] = df_est[c].astype("string").str.strip()
 
+    # Coordenadas geográficas decimales para mapas (Azure Maps / Power BI)
+    if "longitud_raw" in df_est.columns:
+        df_est["longitud"] = df_est["longitud_raw"].apply(dms_compacto_a_decimal)
+        df_est["longitud"] = pd.to_numeric(df_est["longitud"], errors="coerce")
+
+    if "latitud_raw" in df_est.columns:
+        df_est["latitud"] = df_est["latitud_raw"].apply(dms_compacto_a_decimal)
+        df_est["latitud"] = pd.to_numeric(df_est["latitud"], errors="coerce")
+
     if "estacion_codigo" in df_est.columns:
-        df_est["estacion_codigo"] = df_est["estacion_codigo"].astype("string").str.upper()
+        df_est["estacion_codigo"] = (
+            df_est["estacion_codigo"]
+            .astype("string")
+            .str.strip()
+            .str.upper()
+        )
+
+        # Nueva clave para relacionar con dim_territorio
+        # Ejemplos: BU02 -> BU, HU01 -> HU, A01 -> A
+        df_est["Codigo_Provincia"] = (
+            df_est["estacion_codigo"]
+            .str.replace(r"\d+$", "", regex=True)
+            .str.strip()
+            .str.upper()
+        )
+
+        unmatched = ~df_est["Codigo_Provincia"].isin(df_territorio["Codigo_Provincia"])
+        n_unmatched = int(unmatched.sum())
+        if n_unmatched > 0:
+            print(f"[WARN] {n_unmatched} estaciones con Codigo_Provincia sin match en TERRITORIO.")
+
+    df_est = df_est.merge(
+        df_territorio[["Codigo_Provincia", "Provincia", "Codigo_CCAA", "CCAA"]],
+        on="Codigo_Provincia",
+        how="left",
+        validate="many_to_one",
+    )
 
     for c in ["fecha_instalacion", "fecha_baja"]:
         if c in df_est.columns:
@@ -419,14 +510,14 @@ def run_info_gold() -> Dict[str, Path]:
         Dict[str, Path]: Diccionario con las rutas de salida de DIM_TERRITORIO
         y DIM_ESTACION en Gold.
     """
-    df_terr = read_table(SILVER_DIR / "siar_territorio.parquet")
+    # df_terr = read_table(SILVER_DIR / "siar_territorio.parquet")
     df_est = read_table(SILVER_DIR / "siar_estaciones.parquet")
 
     # DIM_TERRITORIO: mismo contenido + id
-    dim_terr = df_terr.copy()
-    dim_terr = dim_terr.drop_duplicates(subset=["Codigo_Provincia"], keep="first").reset_index(drop=True)
-    dim_terr = dim_terr.sort_values(["Codigo_CCAA", "Codigo_Provincia"]).reset_index(drop=True)
-    dim_terr.insert(0, "territorio_id", range(1, len(dim_terr) + 1))
+    # dim_terr = df_terr.copy()
+    # dim_terr = dim_terr.drop_duplicates(subset=["Codigo_Provincia"], keep="first").reset_index(drop=True)
+    # dim_terr = dim_terr.sort_values(["Codigo_CCAA", "Codigo_Provincia"]).reset_index(drop=True)
+    # dim_terr.insert(0, "territorio_id", range(1, len(dim_terr) + 1))
 
     # DIM_ESTACION: igual que antes
     dim_est = df_est.sort_values(["estacion_codigo"]).reset_index(drop=True)
@@ -437,23 +528,29 @@ def run_info_gold() -> Dict[str, Path]:
         "estacion_codigo",
         "estacion_nombre",
         "termino_municipal",
+        "Codigo_Provincia",
+        "Provincia",
+        "Codigo_CCAA",
+        "CCAA",
         "red_estacion",
         "altitud_m",
-        "utm_huso",
-        "utm_x",
-        "utm_y",
+        "latitud",
+        "longitud",
+        "latitud_raw",
+        "longitud_raw",
         "fecha_instalacion",
         "fecha_baja",
     ]
+
     keep_est = [c for c in keep_est if c in dim_est.columns]
     dim_est = dim_est[keep_est]
 
     paths = {
-        "DIM_TERRITORIO": GOLD_DIR / "dim_territorio.parquet",
+        # "DIM_TERRITORIO": GOLD_DIR / "dim_territorio.parquet",
         "DIM_ESTACION": GOLD_DIR / "dim_estacion.parquet",
     }
 
-    save_df_overwrite(dim_terr, paths["DIM_TERRITORIO"])
+    # save_df_overwrite(dim_terr, paths["DIM_TERRITORIO"])
     save_df_overwrite(dim_est, paths["DIM_ESTACION"])
 
     return paths
