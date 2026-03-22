@@ -96,32 +96,32 @@ def main():
         log_line("[INFO] Token obtenido correctamente.")
 
         # 2️⃣ Pipeline INFO
-        log_line("[INFO] Ejecutando pipeline INFO...")
-        run_info_pipeline(token=token)
+        # log_line("[INFO] Ejecutando pipeline INFO...")
+        # run_info_pipeline(token=token)
 
         # log_line("[INFO] Esperando 65s tras INFO para evitar límites por minuto...")
         # time.sleep(65)
 
-        # # 3️⃣ Pipeline DATOS
-        # log_line("[INFO] Ejecutando pipeline DATOS...")
+        # 3️⃣ Pipeline DATOS
+        log_line("[INFO] Ejecutando pipeline DATOS...")
         
-        # estaciones, bajas = load_stations_and_bajas()
-        # log_line(f"[INFO] Número de estaciones cargadas: {len(estaciones)}")
+        estaciones, bajas = load_stations_and_bajas()
+        log_line(f"[INFO] Número de estaciones cargadas: {len(estaciones)}")
 
-        # run_datos_pipeline(
-        #     token=token,
-        #     estaciones=estaciones,
-        #     station_bajas=bajas,
-        #     start_date="2025-02-19",
-        #     end_date=str(date.today() - timedelta(days=1)),
-        #     datos_calculados=True,
-        #     min_access_buffer=5,
-        #     min_records_buffer=2000,
-        #     sleep_s=14,
-        # )
+        run_datos_pipeline(
+            token=token,
+            estaciones=estaciones,
+            station_bajas=bajas,
+            start_date="2025-02-19",
+            end_date=str(date.today() - timedelta(days=1)),
+            datos_calculados=True,
+            min_access_buffer=5,
+            min_records_buffer=2000,
+            sleep_s=14,
+        )
 
-        # elapsed = perf_counter() - t0
-        # log_line(f"[INFO] Proceso finalizado correctamente. Duración total: {format_seconds(elapsed)}")
+        elapsed = perf_counter() - t0
+        log_line(f"[INFO] Proceso finalizado correctamente. Duración total: {format_seconds(elapsed)}")
 
     except Exception as e:
         elapsed = perf_counter() - t0
