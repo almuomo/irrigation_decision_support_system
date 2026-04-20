@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 from calendar import monthrange
+
 from scripts.common.settings import (
     SIAR_BASE_URL,
     DATA_BRONZE_DATOS_DIR,
@@ -13,6 +14,7 @@ from scripts.common.settings import (
     DATA_GOLD_DIR,
     CHECKPOINT_SIAR_DIARIOS_ESTACION,
     LOGS_DIR,
+    DIM_ESTACION_PATH,
 )
 
 import pandas as pd
@@ -24,6 +26,8 @@ SILVER_DIR = DATA_SILVER_DIR
 GOLD_DIR = DATA_GOLD_DIR
 CHECKPOINT_PATH = CHECKPOINT_SIAR_DIARIOS_ESTACION
 LOG_DIR = LOGS_DIR
+FIRST_VALID_CACHE_PATH = CHECKPOINT_PATH.with_name("siar_diarios_estacion_first_valid.json")
+BUDGET_REFRESH_EVERY_CHUNKS = 12
 
 DEFAULT_TIMEOUT = 60
 MIN_API_DATE = date(1999, 1, 1)
@@ -32,6 +36,7 @@ MIN_API_DATE = date(1999, 1, 1)
 def utc_now() -> datetime:
     """
     Devuelve la fecha y hora actual en UTC sin microsegundos.
+
     Returns:
         datetime: Timestamp actual en zona horaria UTC.
     """
@@ -41,6 +46,7 @@ def utc_now() -> datetime:
 def ensure_dir(p: Path) -> None:
     """
     Crea un directorio y sus carpetas padre si no existen.
+
     Args:
         p (Path): Ruta del directorio a crear.
     """
@@ -76,6 +82,96 @@ def save_checkpoint(state: Dict[str, str]) -> None:
     with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
 
+def load_json_map(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_json_map(path: Path, payload: Dict[str, str]) -> None:
+    ensure_dir(path.parent)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+def get_safe_budget(accesos: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    if not accesos:
+        return {
+            "acc_min_left": 999999,
+            "acc_day_left": 999999,
+            "reg_min_left": 999999,
+            "reg_day_left": 999999,
+        }
+    return remaining_budget(accesos)
+
+def probe_chunk_acceptance(
+    token: str,
+    estacion_id: str,
+    fecha_ini: str,
+    fecha_fin: str,
+    datos_calculados: bool,
+) -> str:
+    """
+    Devuelve:
+    - 'accepted' si la API acepta el rango (haya o no filas)
+    - 'invalid_min_date' si la fecha inicial no es válida para esa estación
+    """
+    try:
+        fetch_diarios_estacion(
+            token=token,
+            estacion_id=estacion_id,
+            fecha_ini=fecha_ini,
+            fecha_fin=fecha_fin,
+            datos_calculados=datos_calculados,
+            max_retries=3,
+            wait_s=65,
+        )
+        return "accepted"
+    except Exception as e:
+        if is_min_date_api_error(e):
+            return "invalid_min_date"
+        raise
+
+def discover_first_valid_chunk_start(
+    token: str,
+    estacion_id: str,
+    d_station_start: date,
+    d_station_end: date,
+    datos_calculados: bool,
+) -> Optional[date]:
+    """
+    Busca por bisección el primer chunk mensual que la API acepta para la estación.
+    No busca el primer día con datos, sino el primer mes cuya fecha inicial ya no
+    dispara el error de fecha mínima no válida.
+    """
+    chunks = month_chunks(d_station_start, d_station_end, step_months=1)
+    if not chunks:
+        return None
+
+    low, high = 0, len(chunks) - 1
+    found_idx: Optional[int] = None
+
+    while low <= high:
+        mid = (low + high) // 2
+        a, b = chunks[mid]
+
+        status = probe_chunk_acceptance(
+            token=token,
+            estacion_id=estacion_id,
+            fecha_ini=a.isoformat(),
+            fecha_fin=b.isoformat(),
+            datos_calculados=datos_calculados,
+        )
+
+        if status == "invalid_min_date":
+            low = mid + 1
+        else:
+            found_idx = mid
+            high = mid - 1
+
+    if found_idx is None:
+        return None
+
+    return chunks[found_idx][0]
 
 def log_line(msg: str) -> None:
     """
@@ -95,47 +191,101 @@ def log_line(msg: str) -> None:
         f.write(line + "\n")
 
 
-def get_accesos(token: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+def get_accesos(
+    token: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_retries: int = 5,
+    wait_s: int = 15,
+) -> Dict[str, Any]:
     """
     Consulta el endpoint Info/ACCESOS de SIAR para obtener límites y consumo.
 
-    Esta función devuelve el primer elemento del bloque 'datos' de la respuesta,
-    que incluye métricas como accesos máximos por día, accesos consumidos,
-    registros máximos y registros acumulados.
-
-    Args:
-        token (str): Token de autenticación para la API SIAR.
-        timeout (int, optional): Tiempo máximo de espera de la petición HTTP.
-
-    Returns:
-        Dict[str, Any]: Diccionario con la información de cuotas y consumo.
+    Si SIAR devuelve 403 o un error temporal, reintenta varias veces antes
+    de devolver un diccionario vacío.
     """
     url = f"{BASE}/API/V1/Info/ACCESOS"
-    r = requests.get(url, params={"token": token}, timeout=timeout)
-    r.raise_for_status()
-    payload = r.json()
-    datos = payload.get("datos", [])
-    return datos[0] if isinstance(datos, list) and datos else {}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, params={"token": token}, timeout=timeout)
+
+            if r.status_code == 403:
+                log_line(
+                    f"[WARN] Info/ACCESOS 403 intento={attempt}/{max_retries}. "
+                    f"Esperando {wait_s}s antes de reintentar."
+                )
+                time.sleep(wait_s)
+                continue
+
+            r.raise_for_status()
+
+            payload = r.json()
+            datos = payload.get("datos", [])
+            return datos[0] if isinstance(datos, list) and datos else {}
+
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                log_line(
+                    f"[WARN] Error consultando Info/ACCESOS intento={attempt}/{max_retries} "
+                    f"err={repr(e)}. Esperando {wait_s}s."
+                )
+                time.sleep(wait_s)
+                continue
+
+            log_line(
+                f"[WARN] No se pudo consultar Info/ACCESOS tras {max_retries} intentos. "
+                f"err={repr(e)}"
+            )
+            return {}
 
 
-def remaining_budget(accesos: Dict[str, Any]) -> Tuple[int, int]:
+def remaining_budget(accesos: Dict[str, Any]) -> Dict[str, int]:
     """
-    Calcula el presupuesto restante de accesos y registros del día.
-
-    Args:
-        accesos (Dict[str, Any]): Diccionario devuelto por Info/ACCESOS.
-
-    Returns:
-        Tuple[int, int]: Tupla con:
-            - accesos_restantes_dia
-            - registros_restantes_dia
+    Calcula presupuesto restante tanto por minuto como por día.
     """
-    max_acc = int(accesos.get("MaxAccesosDia", 0) or 0)
-    used_acc = int(accesos.get("NumAccesosDiaActual", 0) or 0)
-    max_reg = int(accesos.get("MaxRegistrosDia", 0) or 0)
-    used_reg = int(accesos.get("RegistrosAcumuladosDia", 0) or 0)
-    return max(0, max_acc - used_acc), max(0, max_reg - used_reg)
+    max_acc_min = int(accesos.get("MaxAccesosMinuto", 0) or 0)
+    used_acc_min = int(accesos.get("NumAccesosMinutoActual", 0) or 0)
 
+    max_acc_day = int(accesos.get("MaxAccesosDia", 0) or 0)
+    used_acc_day = int(accesos.get("NumAccesosDiaActual", 0) or 0)
+
+    max_reg_min = int(accesos.get("MaxRegistrosMinuto", 0) or 0)
+    used_reg_min = int(accesos.get("RegistrosAcumuladosMinuto", 0) or 0)
+
+    max_reg_day = int(accesos.get("MaxRegistrosDia", 0) or 0)
+    used_reg_day = int(accesos.get("RegistrosAcumuladosDia", 0) or 0)
+
+    return {
+        "acc_min_left": max(0, max_acc_min - used_acc_min) if max_acc_min else 999999,
+        "acc_day_left": max(0, max_acc_day - used_acc_day) if max_acc_day else 999999,
+        "reg_min_left": max(0, max_reg_min - used_reg_min) if max_reg_min else 999999,
+        "reg_day_left": max(0, max_reg_day - used_reg_day) if max_reg_day else 999999,
+        "used_acc_min": used_acc_min,
+        "used_acc_day": used_acc_day,
+        "used_reg_min": used_reg_min,
+        "used_reg_day": used_reg_day,
+        "max_acc_min": max_acc_min,
+        "max_acc_day": max_acc_day,
+        "max_reg_min": max_reg_min,
+        "max_reg_day": max_reg_day,
+    }
+
+def is_minute_quota_error_text(text: str) -> bool:
+    """
+    Detecta límites SIAR por minuto, tanto de peticiones como de datos.
+    """
+    msg = (text or "").lower()
+
+    return (
+        "en un minuto" in msg
+        and (
+            "número de peticiones permitidas" in msg
+            or "máximo de peticiones permitidas" in msg
+            or "número máximo de datos permitidos" in msg
+            or "máximo de datos permitidos" in msg
+            or "rebasaría el número máximo de datos permitidos" in msg
+        )
+    )
 
 def sanitize_query_dates(fecha_ini: str, fecha_fin: str) -> tuple[str, str]:
     """
@@ -159,11 +309,9 @@ def sanitize_query_dates(fecha_ini: str, fecha_fin: str) -> tuple[str, str]:
     d_ini = date.fromisoformat(fecha_ini)
     d_fin = date.fromisoformat(fecha_fin)
 
-    # SIAR no permite fechas anteriores a 1999-01-01
     if d_ini < MIN_API_DATE:
         d_ini = MIN_API_DATE
 
-    # SIAR no permite fechas futuras; usamos hoy como máximo duro
     today = date.today()
     if d_fin > today:
         d_fin = today
@@ -175,33 +323,31 @@ def sanitize_query_dates(fecha_ini: str, fecha_fin: str) -> tuple[str, str]:
 
     return d_ini.isoformat(), d_fin.isoformat()
 
+def is_min_date_api_error(exc: Exception) -> bool:
+    """
+    Indica si una excepción corresponde al error de SIAR por fecha mínima autorizada.
+    """
+    msg = str(exc).lower()
+    return "403 por fecha mínima" in msg or (
+        "fecha inicial" in msg and "inferior" in msg and "autorizada" in msg
+    )
 
 # -------------------------
 # BRONCE
 # -------------------------
-def fetch_diarios_estacion(token: str, estacion_id: str, fecha_ini: str, fecha_fin: str, datos_calculados: bool, timeout: int = DEFAULT_TIMEOUT, max_retries: int = 6,) -> Dict[str, Any]:
+def fetch_diarios_estacion(
+    token: str,
+    estacion_id: str,
+    fecha_ini: str,
+    fecha_fin: str,
+    datos_calculados: bool,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_retries: int = 6,
+    wait_s: int = 65,
+) -> Dict[str, Any]:
     """
     Descarga datos diarios de una estación SIAR para un intervalo de fechas.
-
-    La función llama al endpoint /API/V1/Datos/Diarios/ESTACION, sanea antes
-    las fechas de consulta y reintenta automáticamente si detecta el límite
-    de peticiones por minuto.
-
-    Args:
-        token (str): Token de autenticación para la API SIAR.
-        estacion_id (str): Identificador de la estación.
-        fecha_ini (str): Fecha inicial en formato YYYY-MM-DD.
-        fecha_fin (str): Fecha final en formato YYYY-MM-DD.
-        datos_calculados (bool): Indica si se solicitan datos calculados.
-        timeout (int, optional): Tiempo máximo de espera de la petición HTTP.
-        max_retries (int, optional): Número máximo de reintentos ante rate limit.
-
-    Returns:
-        Dict[str, Any]: Respuesta JSON de la API convertida a diccionario.
-
-    Raises:
-        RuntimeError: Si la API devuelve error, si se supera el número de
-            reintentos o si se detecta una restricción no recuperable.
+    Reintenta automáticamente ante límites por minuto de peticiones o datos.
     """
     fecha_ini, fecha_fin = sanitize_query_dates(fecha_ini, fecha_fin)
 
@@ -215,16 +361,37 @@ def fetch_diarios_estacion(token: str, estacion_id: str, fecha_ini: str, fecha_f
     }
 
     for attempt in range(1, max_retries + 1):
-        r = requests.get(url, params=params, timeout=timeout)
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                log_line(
+                    f"[WARN] Error HTTP est={estacion_id} rango={fecha_ini}..{fecha_fin} "
+                    f"intento={attempt}/{max_retries} err={repr(e)}. Esperando {wait_s}s."
+                )
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(
+                f"[SIAR] Error de red est={estacion_id} fecha_ini={fecha_ini} "
+                f"fecha_fin={fecha_fin} err={repr(e)}"
+            ) from e
 
-        # Rate limit por minuto
-        if r.status_code == 403 and "número de peticiones permitidas en un minuto" in r.text.lower():
-            wait_s = 15  # margen sobre 12s
-            print(f"[RATE] Límite por minuto. Esperando {wait_s}s (intento {attempt}/{max_retries})...")
-            time.sleep(wait_s)
-            continue
+        if r.status_code == 403 and is_minute_quota_error_text(r.text):
+            if attempt < max_retries:
+                log_line(
+                    f"[RATE] Límite SIAR por minuto est={estacion_id} "
+                    f"rango={fecha_ini}..{fecha_fin} intento={attempt}/{max_retries}. "
+                    f"Esperando {wait_s}s."
+                )
+                time.sleep(wait_s)
+                continue
 
-        # Fecha mínima autorizada (lo mantenemos informativo)
+            raise RuntimeError(
+                f"[SIAR] Excedidos reintentos por cuota/minuto "
+                f"est={estacion_id} fecha_ini={fecha_ini} fecha_fin={fecha_fin} "
+                f"body={r.text[:500]}"
+            )
+
         if r.status_code == 403 and "fecha inicial" in r.text.lower() and "inferior" in r.text.lower():
             raise RuntimeError(f"[SIAR] 403 por fecha mínima: {r.text[:500]}")
 
@@ -237,7 +404,9 @@ def fetch_diarios_estacion(token: str, estacion_id: str, fecha_ini: str, fecha_f
 
         return r.json()
 
-    raise RuntimeError("[SIAR] Excedidos reintentos por rate limit.")
+    raise RuntimeError(
+        f"[SIAR] Excedidos reintentos est={estacion_id} fecha_ini={fecha_ini} fecha_fin={fecha_fin}"
+    )
 
 
 def payload_to_df(payload: Dict[str, Any]) -> pd.DataFrame:
@@ -259,7 +428,13 @@ def payload_to_df(payload: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(datos)
 
 
-def save_bronze_chunk(payload: Dict[str, Any], estacion_id: str, fecha_ini: str, fecha_fin: str, datos_calculados: bool,) -> Path:
+def save_bronze_chunk(
+    payload: Dict[str, Any],
+    estacion_id: str,
+    fecha_ini: str,
+    fecha_fin: str,
+    datos_calculados: bool,
+) -> Path:
     """
     Guarda en Bronze un bloque JSON crudo descargado de la API SIAR.
 
@@ -306,7 +481,6 @@ def upsert_silver_append_dedupe(df_new: pd.DataFrame, path: Path, key_cols: List
     """
     ensure_dir(path.parent)
 
-    # eliminar columnas completamente vacías (causa del FutureWarning)
     df_new = df_new.dropna(axis=1, how="all")
 
     if df_new.empty:
@@ -315,9 +489,7 @@ def upsert_silver_append_dedupe(df_new: pd.DataFrame, path: Path, key_cols: List
     if path.exists():
         df_old = pd.read_parquet(path)
 
-        # aseguramos mismas columnas
         common_cols = df_old.columns.union(df_new.columns)
-
         df_old = df_old.reindex(columns=common_cols)
         df_new = df_new.reindex(columns=common_cols)
 
@@ -330,7 +502,7 @@ def upsert_silver_append_dedupe(df_new: pd.DataFrame, path: Path, key_cols: List
         df_all = df_all.drop_duplicates(subset=keys, keep="last")
 
     df_all.to_parquet(path, index=False)
-    
+
 
 def load_silver_minimal(silver_path: Path, cols: List[str]) -> Optional[pd.DataFrame]:
     """
@@ -350,6 +522,7 @@ def load_silver_minimal(silver_path: Path, cols: List[str]) -> Optional[pd.DataF
     if not silver_path.exists():
         return None
     return pd.read_parquet(silver_path, columns=[c for c in cols if c])
+
 
 def save_df_overwrite(df: pd.DataFrame, path: Path) -> None:
     """
@@ -383,6 +556,105 @@ def read_table(path: Path) -> pd.DataFrame:
         return pd.read_csv(csv_path)
 
     raise FileNotFoundError(f"No existe {path} ni {csv_path}")
+
+
+def _parse_station_date_series(series: pd.Series) -> pd.Series:
+    """
+    Convierte una serie de fechas de estación a date, soportando:
+    - datetime/timestamp
+    - strings ISO
+    - enteros en milisegundos epoch
+    """
+    s = series.copy()
+
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_datetime(s, unit="ms", errors="coerce", utc=True).dt.date
+
+    s = s.astype("string").str.strip()
+    numeric_mask = s.str.fullmatch(r"\d+")
+
+    out = pd.to_datetime(s, errors="coerce", utc=True)
+
+    if numeric_mask.any():
+        out.loc[numeric_mask] = pd.to_datetime(
+            s.loc[numeric_mask].astype("int64"),
+            unit="ms",
+            errors="coerce",
+            utc=True,
+        )
+
+    return out.dt.date
+
+
+def build_station_start_dates_from_info() -> Dict[str, Optional[str]]:
+    """
+    Lee dim_estacion.parquet y construye un diccionario
+    estacion_codigo -> fecha_instalacion mínima (YYYY-MM-DD).
+    """
+    path = DIM_ESTACION_PATH
+
+    if not path.exists():
+        log_line(f"[WARN] No existe {path}. Se usará start_date global.")
+        return {}
+
+    df = read_table(path).copy()
+
+    required_cols = {"estacion_codigo", "fecha_instalacion"}
+    if not required_cols.issubset(df.columns):
+        log_line(
+            "[WARN] dim_estacion no contiene estacion_codigo y fecha_instalacion. "
+            "Se usará start_date global."
+        )
+        return {}
+
+    df["estacion_codigo"] = (
+        df["estacion_codigo"]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+    )
+
+    df["fecha_instalacion"] = _parse_station_date_series(df["fecha_instalacion"])
+
+    agg = (
+        df.groupby("estacion_codigo", dropna=False)["fecha_instalacion"]
+        .min()
+        .reset_index()
+    )
+
+    out: Dict[str, Optional[str]] = {}
+    for _, row in agg.iterrows():
+        est = row["estacion_codigo"]
+        fi = row["fecha_instalacion"]
+        out[str(est).strip().upper()] = fi.isoformat() if pd.notna(fi) else None
+
+    log_line(f"[INFO] Fechas de instalación cargadas para {len(out)} estaciones desde dim_estacion.")
+    return out
+
+
+def normalize_station_date_map(
+    station_dates: Optional[Dict[str, Optional[str]]],
+) -> Dict[str, Optional[str]]:
+    """
+    Normaliza un diccionario estación -> fecha a claves en mayúsculas.
+
+    Args:
+        station_dates (Optional[Dict[str, Optional[str]]]): Diccionario original.
+
+    Returns:
+        Dict[str, Optional[str]]: Diccionario normalizado.
+    """
+    if not station_dates:
+        return {}
+
+    out: Dict[str, Optional[str]] = {}
+    for k, v in station_dates.items():
+        if k is None:
+            continue
+        out[str(k).strip().upper()] = v
+    return out
+
+
 # -------------------------
 # GOLD
 # -------------------------
@@ -399,8 +671,6 @@ def run_datos_gold(datos_calculados: bool = True) -> Dict[str, Path]:
     if df.empty:
         raise ValueError(f"El fichero Silver está vacío: {silver_path}")
 
-    # Estandarización mínima opcional
-    # Solo renombrar si existen esas columnas
     rename_map = {
         "Estacion": "estacion_codigo",
         "Fecha": "fecha",
@@ -408,17 +678,14 @@ def run_datos_gold(datos_calculados: bool = True) -> Dict[str, Path]:
     rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
     df = df.rename(columns=rename_map)
 
-    # Normalización básica
     if "estacion_codigo" in df.columns:
         df["estacion_codigo"] = df["estacion_codigo"].astype("string").str.strip().str.upper()
 
     if "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
 
-    # Metadato de snapshot Gold
     df["gold_generated_utc"] = utc_now().isoformat()
 
-    # Ordenar para dejar estructura estable
     sort_cols = [c for c in ["estacion_codigo", "fecha"] if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols).reset_index(drop=True)
@@ -431,7 +698,12 @@ def run_datos_gold(datos_calculados: bool = True) -> Dict[str, Path]:
     return {"FACT_DIARIOS_ESTACION": gold_path}
 
 
-def is_month_complete_in_silver(df_silver: Optional[pd.DataFrame], estacion: str, month_start: date, month_end: date) -> bool:
+def is_month_complete_in_silver(
+    df_silver: Optional[pd.DataFrame],
+    estacion: str,
+    month_start: date,
+    month_end: date,
+) -> bool:
     """
     Comprueba si una estación ya tiene cargados en Silver todos los días
     de un rango mensual dado.
@@ -452,17 +724,16 @@ def is_month_complete_in_silver(df_silver: Optional[pd.DataFrame], estacion: str
     if "Estacion" not in df_silver.columns or "Fecha" not in df_silver.columns:
         return False
 
-    # días esperados (YYYY-MM-DD)
     expected = set(
         (month_start + timedelta(days=i)).isoformat()
         for i in range((month_end - month_start).days + 1)
     )
 
-    # Fechas existentes para esa estación
-    fechas = df_silver.loc[df_silver["Estacion"] == estacion, "Fecha"].astype(str)
+    fechas = df_silver.loc[df_silver["Estacion"].astype(str).str.upper() == estacion, "Fecha"].astype(str)
     existing = set(fechas[fechas.isin(expected)].tolist())
 
     return expected.issubset(existing)
+
 
 def month_chunks(start: date, end: date, step_months: int = 1) -> List[Tuple[date, date]]:
     """
@@ -479,15 +750,16 @@ def month_chunks(start: date, end: date, step_months: int = 1) -> List[Tuple[dat
     Returns:
         List[Tuple[date, date]]: Lista de rangos [ini, fin].
     """
+    if start > end:
+        return []
+
     out: List[Tuple[date, date]] = []
     cur = start.replace(day=1)
 
     while cur <= end:
-        # calcular mes final del bloque
         year = cur.year
         month = cur.month + step_months - 1
 
-        # ajustar overflow de meses
         while month > 12:
             month -= 12
             year += 1
@@ -497,9 +769,10 @@ def month_chunks(start: date, end: date, step_months: int = 1) -> List[Tuple[dat
 
         a = max(start, cur)
         b = min(end, block_end)
-        out.append((a, b))
 
-        # avanzar step_months meses
+        if a <= b:
+            out.append((a, b))
+
         next_month = cur.month + step_months
         next_year = cur.year
 
@@ -511,16 +784,19 @@ def month_chunks(start: date, end: date, step_months: int = 1) -> List[Tuple[dat
 
     return out
 
+
 def run_incremental_diarios_por_estacion(
     token: str,
     estaciones: List[str],
     station_bajas: Optional[Dict[str, Optional[str]]] = None,
-    start_date: str = "2020-01-01",
+    station_start_dates: Optional[Dict[str, Optional[str]]] = None,
+    start_date: str = "1999-01-01",
     end_date: Optional[str] = None,
     datos_calculados: bool = False,
     min_access_buffer: int = 5,
     min_records_buffer: int = 2000,
     sleep_s: float = 0.3,
+    rebuild_history: bool = False,
 ) -> None:
     """
     Ejecuta la carga incremental de datos diarios SIAR por estación.
@@ -530,88 +806,157 @@ def run_incremental_diarios_por_estacion(
     - calcula el rango pendiente por estación,
     - divide el periodo en bloques mensuales,
     - evita llamar a SIAR si el mes ya está completo en Silver,
-    - controla cuotas diarias mediante Info/ACCESOS,
+    - controla cuotas diarias y por minuto mediante Info/ACCESOS,
     - descarga cada bloque en Bronze,
     - transforma el payload y actualiza Silver,
     - guarda el checkpoint tras cada bloque correcto.
+
+    Si rebuild_history=True:
+    - se ignora el checkpoint previo,
+    - el inicio de cada estación se calcula con su fecha_instalacion
+      cuando esté disponible,
+    - si no existe fecha_instalacion, se usa start_date global.
 
     Args:
         token (str): Token de autenticación para la API SIAR.
         estaciones (List[str]): Lista de identificadores de estación.
         station_bajas (Optional[Dict[str, Optional[str]]], optional):
-            Diccionario estación -> fecha_baja en formato ISO. Si una estación
-            está dada de baja antes del inicio global, se omite.
+            Diccionario estación -> fecha_baja en formato ISO.
+        station_start_dates (Optional[Dict[str, Optional[str]]], optional):
+            Diccionario estación -> fecha_instalacion en formato ISO.
         start_date (str, optional): Fecha inicial global en formato YYYY-MM-DD.
         end_date (Optional[str], optional): Fecha final global. Si no se indica,
             se usa ayer.
         datos_calculados (bool, optional): Indica si se descargan datos calculados.
-        min_access_buffer (int, optional): Umbral mínimo de accesos restantes
-            para seguir procesando.
-        min_records_buffer (int, optional): Umbral mínimo de registros restantes
-            para seguir procesando.
+        min_access_buffer (int, optional): Umbral mínimo de accesos restantes por día.
+        min_records_buffer (int, optional): Umbral mínimo de registros restantes por día.
         sleep_s (float, optional): Pausa entre peticiones correctas.
+        rebuild_history (bool, optional): Ignora checkpoint y rehace histórico.
 
     Returns:
         None
     """
     state = load_checkpoint()
-    
+    first_valid_cache = load_json_map(FIRST_VALID_CACHE_PATH)
 
     if end_date is None:
         end_date = str(date.today() - timedelta(days=1))
 
     d_global_start = date.fromisoformat(start_date)
+    if d_global_start < MIN_API_DATE:
+        d_global_start = MIN_API_DATE
+
     d_end = date.fromisoformat(end_date)
 
-    silver_path = SILVER_DIR / f"siar_diarios_estacion_calc{int(datos_calculados)}.parquet"
+    station_bajas_norm = normalize_station_date_map(station_bajas)
+    station_start_dates_norm = normalize_station_date_map(station_start_dates)
 
+    silver_path = SILVER_DIR / f"siar_diarios_estacion_calc{int(datos_calculados)}.parquet"
     df_silver_cache = load_silver_minimal(silver_path, cols=["Fecha", "Estacion"])
 
     key_cols = ["Fecha", "Estacion"]
 
     for est in estaciones:
+        est = str(est).strip().upper()
         ck_key = f"Diarios|ESTACION|{est}|calc={str(datos_calculados).lower()}"
 
-        # --- SKIP estación si está dada de baja antes del start_date global ---
-        if station_bajas is not None:
-            fb = station_bajas.get(est)  # "YYYY-MM-DD" o None
-            if fb:
-                fb_date = date.fromisoformat(fb)
-                if fb_date < d_global_start:
-                    # marcamos checkpoint al final para no reintentar nunca
-                    state[ck_key] = d_end.isoformat()
-                    save_checkpoint(state)
-                    log_line(
-                        f"[SKIP] est={est} motivo=fecha_baja<{d_global_start.isoformat()} "
-                        f"fecha_baja={fb} -> no se extrae"
-                    )
-                    continue
+        d_station_start = d_global_start
+        fi = station_start_dates_norm.get(est)
+        if fi:
+            fi_date = date.fromisoformat(fi)
+            if fi_date > d_station_start:
+                d_station_start = fi_date
 
-        last = state.get(ck_key)
+        d_station_end = d_end
+
+        fb = station_bajas_norm.get(est)
+        if fb:
+            fb_date = date.fromisoformat(fb)
+
+            if fb_date < d_station_start:
+                state[ck_key] = d_end.isoformat()
+                save_checkpoint(state)
+                log_line(
+                    f"[SKIP] est={est} motivo=fecha_baja<{d_station_start.isoformat()} "
+                    f"fecha_baja={fb} -> no se extrae"
+                )
+                continue
+
+            if fb_date < d_station_end:
+                d_station_end = fb_date
+
+        last = None if rebuild_history else state.get(ck_key)
+
         if last:
             d_start = date.fromisoformat(last) + timedelta(days=1)
         else:
-            d_start = d_global_start
+            d_start = d_station_start
 
-        if d_start > d_end:
+        cached_first_valid = first_valid_cache.get(est)
+        if cached_first_valid:
+            d_cached = date.fromisoformat(cached_first_valid)
+            if d_cached > d_start:
+                d_start = d_cached
+
+        # IMPORTANTE: comprobar rango antes de descubrir primer chunk válido
+        if d_start > d_station_end:
+            log_line(
+                f"[SKIP] est={est} motivo=sin_rango_pre_discovery "
+                f"start={d_start.isoformat()} end={d_station_end.isoformat()} "
+                f"fecha_instalacion={fi} fecha_baja={fb}"
+            )
             continue
 
-        chunks = month_chunks(d_start, d_end, step_months=1)
+        if not cached_first_valid:
+            discovered = discover_first_valid_chunk_start(
+                token=token,
+                estacion_id=est,
+                d_station_start=d_start,
+                d_station_end=d_station_end,
+                datos_calculados=datos_calculados,
+            )
+
+            if discovered is None:
+                state[ck_key] = d_station_end.isoformat()
+                save_checkpoint(state)
+                log_line(
+                    f"[SKIP] est={est} motivo=sin_chunk_aceptado_por_api "
+                    f"start={d_start.isoformat()} end={d_station_end.isoformat()}"
+                )
+                continue
+
+            first_valid_cache[est] = discovered.isoformat()
+            save_json_map(FIRST_VALID_CACHE_PATH, first_valid_cache)
+
+            if discovered > d_start:
+                d_start = discovered
+
+        if d_start > d_station_end:
+            log_line(
+                f"[SKIP] est={est} motivo=sin_rango "
+                f"start={d_start.isoformat()} end={d_station_end.isoformat()}"
+            )
+            continue
+
+        log_line(
+            f"[INFO] est={est} inicio_real={d_start.isoformat()} "
+            f"fin_real={d_station_end.isoformat()} "
+            f"fecha_instalacion={fi} fecha_baja={fb} rebuild_history={rebuild_history}"
+        )
+
+        chunks = month_chunks(d_start, d_station_end, step_months=1)
+
+        budget = None
+        chunks_since_budget_refresh = BUDGET_REFRESH_EVERY_CHUNKS
 
         for a, b in chunks:
-            # Si ya tengo el mes completo en Silver, no llamo a SIAR (ahorra cuota)
             if is_month_complete_in_silver(df_silver_cache, est, a, b):
                 state[ck_key] = b.isoformat()
                 save_checkpoint(state)
-                log_line(f"[SKIP] est={est} rango={a.isoformat()}..{b.isoformat()} motivo=month_complete")
+                log_line(
+                    f"[SKIP] est={est} rango={a.isoformat()}..{b.isoformat()} motivo=month_complete"
+                )
                 continue
-            accesos = get_accesos(token)
-            acc_left, reg_left = remaining_budget(accesos)
-
-            if acc_left <= min_access_buffer or reg_left <= min_records_buffer:
-                log_line(f"[STOP] quota_low accesos_left={acc_left} registros_left={reg_left}")
-                save_checkpoint(state)
-                return
 
             fecha_ini = a.isoformat()
             fecha_fin = b.isoformat()
@@ -619,8 +964,52 @@ def run_incremental_diarios_por_estacion(
             try:
                 fecha_ini, fecha_fin = sanitize_query_dates(fecha_ini, fecha_fin)
             except ValueError as ve:
-                log_line(f"[SKIP] est={est} rango_original={a.isoformat()}..{b.isoformat()} motivo={repr(ve)}")
+                log_line(
+                    f"[SKIP] est={est} rango_original={a.isoformat()}..{b.isoformat()} motivo={repr(ve)}"
+                )
                 continue
+
+            expected_rows = (
+                date.fromisoformat(fecha_fin) - date.fromisoformat(fecha_ini)
+            ).days + 1
+
+            if budget is None or chunks_since_budget_refresh >= BUDGET_REFRESH_EVERY_CHUNKS:
+                accesos = get_accesos(token)
+                if not accesos:
+                    log_line("[WARN] No se pudo verificar Info/ACCESOS. Se continúa con prudencia.")
+                budget = get_safe_budget(accesos)
+                chunks_since_budget_refresh = 0
+
+            if (
+                budget["acc_day_left"] <= min_access_buffer
+                or budget["reg_day_left"] <= min_records_buffer
+            ):
+                log_line(
+                    f"[STOP] quota_day_low "
+                    f"acc_day_left={budget['acc_day_left']} "
+                    f"reg_day_left={budget['reg_day_left']}"
+                )
+                save_checkpoint(state)
+                return
+
+            if (
+                budget["acc_min_left"] <= 1
+                or budget["reg_min_left"] < expected_rows
+            ):
+                wait_s = 65
+                log_line(
+                    f"[WAIT] cuota_minuto est={est} rango={fecha_ini}..{fecha_fin} "
+                    f"acc_min_left={budget['acc_min_left']} "
+                    f"reg_min_left={budget['reg_min_left']} "
+                    f"expected_rows={expected_rows}. Esperando {wait_s}s."
+                )
+                time.sleep(wait_s)
+
+                accesos = get_accesos(token)
+                budget = get_safe_budget(accesos)
+
+            acc_left = budget["acc_day_left"]
+            reg_left = budget["reg_day_left"]
 
             try:
                 payload = fetch_diarios_estacion(
@@ -631,7 +1020,13 @@ def run_incremental_diarios_por_estacion(
                     datos_calculados=datos_calculados,
                 )
 
-                bronze_path = save_bronze_chunk(payload, est, fecha_ini, fecha_fin, datos_calculados)
+                bronze_path = save_bronze_chunk(
+                    payload=payload,
+                    estacion_id=est,
+                    fecha_ini=fecha_ini,
+                    fecha_fin=fecha_fin,
+                    datos_calculados=datos_calculados,
+                )
 
                 df = payload_to_df(payload)
                 if not df.empty:
@@ -644,18 +1039,35 @@ def run_incremental_diarios_por_estacion(
                 save_checkpoint(state)
 
                 log_line(
-                    f"[OK] est={est} rango={fecha_ini}..{fecha_fin} filas={len(df)} bronze={bronze_path.name} "
-                    f"accesos_left={acc_left} registros_left={reg_left}"
+                    f"[OK] est={est} rango={fecha_ini}..{fecha_fin} filas={len(df)} "
+                    f"bronze={bronze_path.name} accesos_left={acc_left} registros_left={reg_left}"
                 )
+
+                chunks_since_budget_refresh += 1
+
+                # consumo aproximado local para no reconsultar accesos a cada mes
+                budget["acc_day_left"] = max(0, budget["acc_day_left"] - 1)
+                budget["acc_min_left"] = max(0, budget["acc_min_left"] - 1)
+                budget["reg_day_left"] = max(0, budget["reg_day_left"] - len(df))
+                budget["reg_min_left"] = max(0, budget["reg_min_left"] - len(df))
 
                 time.sleep(sleep_s)
 
             except Exception as e:
-                # guardas checkpoint hasta lo último que estuviera OK
+                if is_min_date_api_error(e):
+                    state[ck_key] = fecha_fin
+                    save_checkpoint(state)
+
+                    log_line(
+                        f"[WARN] est={est} rango={fecha_ini}..{fecha_fin} "
+                        f"motivo=fecha_minima_api_no_valida -> se salta chunk y se continúa"
+                    )
+                    continue
+
                 save_checkpoint(state)
                 log_line(f"[ERROR] est={est} rango={fecha_ini}..{fecha_fin} err={repr(e)}")
                 raise
-        
+
     save_checkpoint(state)
     log_line("[DONE] Incremental completo.")
 
@@ -664,29 +1076,38 @@ def run_datos_pipeline(
     token: str,
     estaciones: List[str],
     station_bajas: Optional[Dict[str, Optional[str]]] = None,
-    start_date: str = "2020-01-01",
+    start_date: str = "1999-01-01",
     end_date: Optional[str] = None,
     datos_calculados: bool = True,
     min_access_buffer: int = 5,
     min_records_buffer: int = 2000,
     sleep_s: float = 0.3,
+    rebuild_history: bool = False,
 ) -> None:
     """
     Orquesta la carga de datos diarios SIAR:
     Bronze -> Silver incremental -> Gold snapshot
+
+    Si rebuild_history=True:
+    - el inicio de cada estación se calcula con fecha_instalacion,
+    - se ignora el checkpoint.
     """
     log_line("[INFO] Iniciando pipeline SIAR DATOS...")
+
+    station_start_dates = build_station_start_dates_from_info()
 
     run_incremental_diarios_por_estacion(
         token=token,
         estaciones=estaciones,
         station_bajas=station_bajas,
+        station_start_dates=station_start_dates,
         start_date=start_date,
         end_date=end_date,
         datos_calculados=datos_calculados,
         min_access_buffer=min_access_buffer,
         min_records_buffer=min_records_buffer,
         sleep_s=sleep_s,
+        rebuild_history=rebuild_history,
     )
 
     g = run_datos_gold(datos_calculados=datos_calculados)
